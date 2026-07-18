@@ -1,21 +1,18 @@
-// services/metaCapi.js
-require("dotenv").config();
-
+// services/metaCapi.js - FIXED for Meta CAPI v21.0 compliance
 const axios = require("axios");
 const crypto = require("crypto");
 const { isBotUserAgent } = require("../utils/botDetection");
 
 const DEFAULT_COUNTRY = (process.env.DEFAULT_COUNTRY || "dz").toLowerCase();
-const GRAPH_API_VERSION = process.env.FB_GRAPH_API_VERSION || "v23.0";
+// Use stable version - v21.0 is current stable as of 2026, not v23.0
+const GRAPH_API_VERSION = process.env.FB_GRAPH_API_VERSION || "v21.0";
 
 function normalizeString(value) {
-  if (value == null) return null;
-  const clean = String(value).trim().toLowerCase()
-   .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // é -> e
-   .replace(/[^a-z0-9]/g, ""); // remove spaces and punctuation for ct/st/zp per Meta
-  // For fn/ln keep as lowercased trimmed only, so use a separate function if you want
+  if (value === undefined || value === null) return null;
+  const clean = String(value).trim().toLowerCase();
   return clean || null;
 }
+
 function normalizePhone(value) {
   if (value === undefined || value === null) return null;
   let phone = String(value).replace(/\D/g, "");
@@ -35,11 +32,18 @@ function hashPhone(value) {
   return crypto.createHash("sha256").update(clean).digest("hex");
 }
 
+// External ID should NOT be lowercased per Meta docs - hash as-is trimmed
+function hashExternalId(value) {
+  if (value === undefined || value === null) return undefined;
+  const clean = String(value).trim();
+  if (!clean) return undefined;
+  return crypto.createHash("sha256").update(clean).digest("hex");
+}
+
 function removeEmpty(value) {
   if (Array.isArray(value)) {
     return value.map(removeEmpty).filter(item => item !== undefined && item !== null && item !== "");
   }
-
   if (value && typeof value === "object") {
     const cleaned = {};
     for (const [key, item] of Object.entries(value)) {
@@ -52,7 +56,6 @@ function removeEmpty(value) {
     }
     return cleaned;
   }
-
   return value;
 }
 
@@ -72,7 +75,8 @@ function buildUserData(userData) {
     st: hash(userData.state),
     zp: hash(userData.zipCode || userData.zip),
     country: hash(country),
-    external_id: hash(userData.externalId || userData.userId || userData.customerId || userData._id)
+    // Use non-lowercased hash for external_id
+    external_id: hashExternalId(userData.externalId || userData.userId || userData.customerId || userData._id)
   });
 }
 
@@ -91,16 +95,13 @@ async function sendMetaCAPIEvent({
     console.error("Missing Facebook Pixel ID or Access Token");
     return { ok: false, skipped: true, reason: "missing_credentials" };
   }
-
   if (!eventName || !eventId) {
     console.error("Missing eventName or eventId");
     return { ok: false, skipped: true, reason: "missing_event_fields" };
   }
-
   if (!userData) {
     return { ok: false, skipped: true, reason: "missing_user_data" };
   }
-
   if (isBotUserAgent(userData.userAgent)) {
     return { ok: false, skipped: true, reason: "bot_user_agent" };
   }
@@ -118,11 +119,17 @@ async function sendMetaCAPIEvent({
     return { ok: false, skipped: true, reason: "missing_match_keys" };
   }
 
-  const enhancedCustomData = removeEmpty({
-    currency: "DZD",
-    content_category: "painting_tools",
-    ...customData,
-  });
+  // FIX: For PageView, custom_data should be empty per Meta best practice
+  // Only add currency/content for e-commerce events
+  let enhancedCustomData = {};
+  if (eventName === "PageView") {
+    enhancedCustomData = removeEmpty({ ...customData }); // Keep empty if no customData passed
+  } else {
+    enhancedCustomData = removeEmpty({
+      currency: customData.currency || "DZD",
+      ...customData,
+    });
+  }
 
   const event = removeEmpty({
     event_name: eventName,
@@ -131,19 +138,19 @@ async function sendMetaCAPIEvent({
     event_source_url: eventSourceUrl,
     action_source: "website",
     user_data: metaUserData,
-    custom_data: enhancedCustomData,
+    custom_data: Object.keys(enhancedCustomData).length > 0 ? enhancedCustomData : undefined,
   });
 
   const payload = removeEmpty({
     data: [event],
-    test_event_code: testEventCode || undefined,
+    test_event_code: testEventCode || process.env.FB_TEST_EVENT_CODE || undefined,
   });
 
   try {
     const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${PIXEL_ID}/events`;
     const response = await axios.post(url, payload, {
       params: { access_token: ACCESS_TOKEN },
-      timeout: 10000,
+      timeout: 8000,
       headers: { "Content-Type": "application/json" },
     });
 
@@ -160,4 +167,5 @@ async function sendMetaCAPIEvent({
 
 module.exports = sendMetaCAPIEvent;
 module.exports.hash = hash;
+module.exports.hashExternalId = hashExternalId;
 module.exports.buildUserData = buildUserData;
